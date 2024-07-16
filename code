@@ -1,0 +1,480 @@
+setwd('~')#set your wd
+library(ieugwasr)
+library(TwoSampleMR)
+#ieugwasr::get_opengwas_jwt()
+#ieugwasr::api_status()
+library(data.table)
+library(tidyverse)
+library(plinkbinr)
+#get_plink_exe()
+library(stringr)
+library(VariantAnnotation)
+library(gassocplot2)
+library(gwasglue)
+library(coloc)
+library(locuscomparer)
+library(forestplot)
+
+
+####get and format your exposure IVs####
+#using QRS duration as an example
+QRS <- fread('GCST007103.tsv')
+colnames(QRS)
+colnames(QRS)[2] <- 'rsid'
+colnames(QRS)[9] <- 'pval'
+# local clump #
+QRS <- QRS|> ieugwasr::ld_clump(QRS, clump_kb = 10000,
+                                clump_r2 = 0.001,
+                                clump_p = 5e-8,
+                                pop = "EUR",
+                                bfile = "/home/1kgv3/EUR",
+                                plink_bin = "/usr/local/lib/R/site-library/plinkbinr/bin/plink_Linux")
+QRS  <- TwoSampleMR::format_data (QRS,
+                                  type = "exposure", 
+                                  snps = NULL,
+                                  header = TRUE,
+                                  snp_col = "rsid",
+                                  beta_col = "beta",
+                                  se_col = "se",
+                                  eaf_col = 'eaf',
+                                  effect_allele_col = "effect_allele",
+                                  other_allele_col = "non_effect_allele",
+                                  pval_col = "pval",
+                                  chr_col = 'chromosome',
+                                  pos_col = 'position_GRCh37',
+                                  samplesize_col = 'n_total',
+                                  gene_col = 'gene')
+QRS$exposure <- 'QRS'
+QRS$id.exposure <- 'QRS'
+## for drug target, use gwas data ± 100 kb of the inhibition genes
+# using SCN5A inhibition as an example
+QRS <- fread('GCST007103.tsv')
+scn5a<- subset(QRS,chromosome==3 & position_GRCh37>38589548-100000 & position_GRCh37<38691164+100000)
+colnames(scn5a)[2] <- 'rsid'
+colnames(scn5a)[9] <- 'pval'
+scn5a <- scn5a|> ieugwasr::ld_clump(scn5a, clump_kb = 100,
+                                    clump_r2 = 0.1,
+                                    clump_p = 5e-8,
+                                    pop = "EUR",
+                                    bfile = "/home/1kgv3/EUR",
+                                    plink_bin = "/usr/local/lib/R/site-library/plinkbinr/bin/plink_Linux")
+scn5a  <- TwoSampleMR::format_data (scn5a  ,
+                                    type = "exposure", 
+                                    snps = NULL,
+                                    header = TRUE,
+                                    snp_col = "rsid",
+                                    beta_col = "beta",
+                                    se_col = "se",
+                                    eaf_col = 'eaf',
+                                    effect_allele_col = "effect_allele",
+                                    other_allele_col = "non_effect_allele",
+                                    pval_col = "pval",
+                                    chr_col = 'chromosome',
+                                    pos_col = 'position_GRCh37',
+                                    samplesize_col = 'n_total',
+                                    gene_col = 'gene')
+scn5a$exposure <- 'scn5a'
+scn5a$id.exposure <- 'scn5a'
+
+#calculate F statiscs and r2#
+get_f<-function(dat,F_value=10){
+  log<-is.na(dat$eaf.exposure)
+  log<-unique(log)
+  if(length(log)==1)
+  {if(log==TRUE){
+    print("lacking eaf, cannot calculate F statistics")
+    return(dat)}
+  }
+  if(is.null(dat$beta.exposure[1])==T || is.na(dat$beta.exposure[1])==T){print("lacking beta, cannot calculate F statistics")
+    return(dat)}
+  if(is.null(dat$se.exposure[1])==T || is.na(dat$se.exposure[1])==T){print("lacking se, cannot calculate F statistics")
+    return(dat)}
+  if(is.null(dat$samplesize.exposure[1])==T || is.na(dat$samplesize.exposure[1])==T){print("lacking sample size ，cannot calculate F statistics")
+    return(dat)}
+  
+  
+  if("FALSE"%in%log && is.null(dat$beta.exposure[1])==F && is.na(dat$beta.exposure[1])==F && is.null(dat$se.exposure[1])==F && is.na(dat$se.exposure[1])==F && is.null(dat$samplesize.exposure[1])==F && is.na(dat$samplesize.exposure[1])==F){
+    R2<-(2*(1-dat$eaf.exposure)*dat$eaf.exposure*(dat$beta.exposure^2))/((2*(1-dat$eaf.exposure)*dat$eaf.exposure*(dat$beta.exposure^2))+(2*(1-dat$eaf.exposure)*dat$eaf.exposure*(dat$se.exposure^2)*dat$samplesize.exposure))
+    F<- (dat$samplesize.exposure-2)*R2/(1-R2)
+    dat$R2<-R2
+    dat$F<-F
+    dat<-subset(dat,F>F_value)
+    return(dat)
+  }
+}
+
+### because there is no eaf in PWD, we need to add eaf online 
+snp_add_eaf <- function(dat, build = "37", pop = "EUR")
+{
+  stopifnot(build %in% c("37","38"))
+  stopifnot("SNP" %in% names(dat))
+  
+  # Create and get a url
+  server <- ifelse(build == "37","http://grch37.rest.ensembl.org","http://rest.ensembl.org")
+  pop <- paste0("1000GENOMES:phase_3:",pop)
+  
+  snp_reverse_base <- function(x)
+  {
+    x <- stringr::str_to_upper(x)
+    stopifnot(x %in% c("A","T","C","G"))
+    switch(x,"A"="T","T"="A","C"="G","G"="C")
+  }
+  
+  res_tab <- lapply(1:nrow(dat), function(i)
+  {
+    print(paste0("seaching for No.", i, " SNP"))
+    dat_i <- dat[i,]
+    
+    ext <- paste0("/variation/Homo_sapiens/",dat_i$SNP, "?content-type=application/json;pops=1")
+    url <- paste(server, ext, sep = "")
+    res <- httr::GET(url)
+    
+    # Converts http errors to R errors or warnings
+    httr::stop_for_status(res)
+    
+    # Convert R objects from JSON
+    res <- httr::content(res)
+    res_pop <- jsonlite::fromJSON(jsonlite::toJSON(res))$populations
+    
+    # Filter query results based on population set
+    res_pop <- try(res_pop[res_pop$population == pop,])
+    if("try-error" %in% class(res_pop))
+    {
+      print(paste0("There is not information for population ",pop))
+      queried_effect_allele <- "NR"
+      queried_other_allele <- "NR"
+      queried_eaf <- -1
+    }
+    else
+    {
+      if(nrow(res_pop)==0)
+      {
+        print(paste0("There is not information for population ",pop))
+        queried_effect_allele <- "NR"
+        queried_other_allele <- "NR"
+        queried_eaf <- -1
+      }
+      else
+      {
+        queried_effect_allele <- res_pop[1,"allele"][[1]]
+        queried_other_allele <- res_pop[2,"allele"][[1]]
+        queried_eaf <- res_pop[1,"frequency"][[1]]    
+      }
+    }
+    
+    effect_allele <- ifelse("effect_allele.exposure" %in% names(dat),
+                            dat_i$effect_allele.exposure,
+                            dat_i$effect_allele)
+    
+    other_allele <- ifelse("effect_allele.exposure" %in% names(dat),
+                           dat_i$other_allele.exposure,
+                           dat_i$other_allele)
+    
+    if("effect_allele.exposure" %in% names(dat))
+    {
+      name_output <- unique(c(names(dat), "eaf.exposure","reliability.exposure"))
+    }
+    else
+    {
+      name_output <- unique(c(names(dat), "eaf","reliability.exposure"))
+    }
+    
+    len_effect_allele <- nchar(effect_allele)
+    len_other_allele <- nchar(other_allele)
+    
+    if(len_effect_allele==1&len_other_allele==1)
+    {
+      if((queried_effect_allele==effect_allele & queried_other_allele==other_allele)|
+         (queried_effect_allele==other_allele & queried_other_allele==effect_allele))
+      {
+        dat_i$eaf.exposure <- ifelse(effect_allele == queried_effect_allele,
+                                     queried_eaf,
+                                     1-queried_eaf)
+        dat_i$eaf <- dat_i$eaf.exposure 
+        dat_i$reliability.exposure <- "high"
+      }
+      else
+      {
+        r_queried_effect_allele <- snp_reverse_base(queried_effect_allele)
+        r_queried_other_allele <- snp_reverse_base(queried_other_allele)
+        if((r_queried_effect_allele==effect_allele & r_queried_other_allele==other_allele)|
+           (r_queried_effect_allele==other_allele & r_queried_other_allele==effect_allele))
+        {
+          dat_i$eaf.exposure <- ifelse(effect_allele == r_queried_effect_allele,
+                                       queried_eaf,
+                                       1-queried_eaf)
+          dat_i$eaf <- dat_i$eaf.exposure 
+          dat_i$reliability.exposure <- "high"
+        }
+        else
+        {
+          dat_i$eaf.exposure <- ifelse(effect_allele == queried_effect_allele,
+                                       queried_eaf,
+                                       1-queried_eaf)
+          dat_i$eaf <- dat_i$eaf.exposure 
+          dat_i$reliability.exposure <- "low"
+        }
+      }
+    }
+    
+    else
+    {
+      # To identify the potential DEL/ INS
+      short_allele <- ifelse(len_effect_allele==1,
+                             effect_allele,
+                             other_allele)
+      short_allele_eaf <- ifelse(short_allele == queried_effect_allele, 
+                                 queried_eaf, 
+                                 1-queried_eaf)
+      dat_i$eaf.exposure <- ifelse(effect_allele == short_allele,
+                                   short_allele_eaf,
+                                   1-short_allele_eaf)
+      dat_i$eaf <- dat_i$eaf.exposure 
+      dat_i$reliability.exposure <- "low"
+    }
+    
+    dat_i[name_output]
+  })
+  
+  return(do.call(rbind, res_tab))
+}
+
+
+#### read and format your outcome data ####
+folder_path <- '~//ukb_outcome'
+file_list <- list.files(path = folder_path, pattern = "\\.zip$", full.names = TRUE)
+total_files <- length(file_list)
+formatted_data_list <- vector("list", total_files)
+pb <- progress_bar$new(
+  total = total_files,
+  format = "[:bar] :percent eta: :eta :current/:total (:file)"
+)
+# loop to format outcome data
+for (i in 1:total_files) {
+  file_path <- file_list[i]
+  file_name <- tools::file_path_sans_ext(basename(file_path))  
+  tryCatch({
+    data <- fread(file_path)  
+    data[, file_name := file_name]  # file names 
+    
+    # formatted data
+    formatted_data <- TwoSampleMR::format_data(
+      data,
+      type = "outcome",
+      snps = NULL,
+      header = TRUE,
+      phenotype_col = "file_name",
+      snp_col = "SNP",
+      beta_col = "BETA",
+      se_col = "SE",
+      eaf_col = 'AF1',
+      effect_allele_col = "A1",
+      other_allele_col = "A2",
+      pval_col = "P",
+      chr_col = 'CHR',
+      pos_col = 'POS',
+      samplesize_col = 'N',
+      gene_col = 'gene'
+    )
+    
+    formatted_data_list[[i]] <- formatted_data  
+  }, error = function(e) {
+    message(sprintf("处理文件 %s 时出错: %s", file_path, e$message))
+  })
+  
+  # update the pb ticks
+  pb$tick(tokens = list(file = basename(file_path)))
+}
+
+# combined data
+combined_formatted_dt <- rbindlist(formatted_data_list, use.names = TRUE, fill = TRUE)
+
+#### positive control of drug target ####
+# AF data was from ieu gwas ebi-a-GCST006414
+af<-extract_outcome_data(snps = scn5a$SNP, outcomes = 'ebi-a-GCST006414',proxies = F)
+mydata <- harmonise_data(exposure_dat=scn5a,outcome_dat=af,action= 2)
+res <- mr(mydata)
+OR <- generate_odds_ratios(res)
+OR$OR_combined <- sprintf("%.3f (%.3f-%.3f)", as.numeric(OR$or), OR$or_lci95, OR$or_uci95)
+het_ivw <- mr_heterogeneity(mydata,method_list = c('mr_ivw'))
+het_egger <- mr_heterogeneity(mydata,method_list = c('mr_egger_regression'))
+pleio <- mr_pleiotropy_test(mydata)
+
+
+#### harmonise and analyse the CMR traits ####
+mydata <- harmonise_data(exposure_dat=scn5a,outcome_dat=combined_formatted_dt,action= 2)
+res <- mr(mydata)
+OR <- generate_odds_ratios(res)
+OR$OR_combined <- sprintf("%.3f (%.3f-%.3f)", as.numeric(OR$or), OR$or_lci95, OR$or_uci95)
+het_ivw <- mr_heterogeneity(mydata,method_list = c('mr_ivw'))
+het_egger <- mr_heterogeneity(mydata,method_list = c('mr_egger_regression'))
+pleio <- mr_pleiotropy_test(mydata)
+
+
+#### coloc ####
+## using scn5a and ukb1, as example ##
+# get a region (300kb)
+scn5a = QRS %>% filter(chr==3,
+                       pos>=38589548-300000,
+                       pos <=38691164+300000)
+data = merge(scn5a,ukb1,by="SNP")
+data = data[!duplicated(data$SNP),]
+data = data[complete.cases(data$Beta), ]
+data = data[complete.cases(data$beta), ]
+data = data %>% filter((effectAllele==effect_allele&otherAllele==other_allele)|(effectAllele==other_allele&otherAllele==effect_allele)) 
+data = data %>% mutate(beta = ifelse(effectAllele==effect_allele,beta,-beta))
+#VAR calculate
+data$VAR.x = data$SE^2
+data$VAR.y = data$se^2
+data = data[data$VAR.x!=0 & data$VAR.y!=0 ,]
+data1 = data[,c("BETA.x","VAR.x","SNP","MAF","N.x")]
+data2 = data[,c("BETA.y","VAR.y","SNP","AF1","N.y")]
+colnames(data1)=c("beta","varbeta","snp","MAF","N")
+colnames(data2)=c("beta","varbeta","snp","MAF","N")
+data1 = as.list(data1)
+data2 = as.list(data2)
+data1$type = "quant"
+data2$type = "quant"
+#coloc analysis
+res = coloc.abf(data1,data2,p1=1e-4,p2=1e-4,p12=1e-5) #see if PPH4 > 0.8 
+need_result <- res$results %>% dplyr::arrange(desc(SNP.PP.H4))
+
+## coloc plot ##
+#prepare .tsv file with rsid and pval
+eqtl_fn = '~\\exposure_ecg\\scn5a.tsv'
+gwas_fn = '~\\ukb\\ukb1.tsv'
+locuscompare(in_fn1 = gwas_fn, 
+             in_fn2 = eqtl_fn, 
+             title1 = 'scn5a', 
+             title2 = 'ukb1')
+
+
+
+#### draw forest plot ####
+## Using KCNQ1 as example ##
+uni <- as.data.frame(KCNQ1_forest)
+uni$X9 <- as.numeric(uni$X9)
+forestplot(labeltext = as.matrix(uni[,1:6]),
+           mean = uni$X7, 
+           lower = uni$X8, 
+           upper = uni$X9, 
+           zero = 0, 
+           boxsize = 0.3,
+           lineheight = unit(20,'mm'),
+           colgap = unit(20,'mm'),
+           lwd.zero = 2,
+           lwd.ci = 2,
+           txt_gp=fpTxtGp(
+             label=gpar(cex=0.7),
+             ticks=gpar(cex=1), 
+             xlab=gpar(cex = 1), 
+             title=gpar(cex = 1)),,
+           col=fpColors(box='#8B008B',summary="#8B008B",lines = '#8B008B',zero = '#7AC5CD'),
+           
+           lwd.xaxis=2,
+           lty.ci = "solid",
+           xticks = c(-0.05, 0, 0.05),
+           is.summary = c(T,T,F,F,F,F,F,F,F,F,F,F,T,F,F,F,F,T,F,F,F,F,T,F,F,F,F,T,F,F,F,F,F,F), 
+           graph.pos = 2,
+           clip = c(-1, 1),
+           hrzl_lines = TRUE,
+           legend_args = fpLegend(5),
+           xlab = 'Beta(95% CI)',
+           title= 'KCNQ1 inhibition' )
+
+
+
+#### reserve mr analysis ####
+# Specify folder path
+folder_path <- '~//ukb'
+# Get the list of files
+file_list <- list.files(path = folder_path, pattern = "\\.zip$", full.names = TRUE)
+# Get the total number of files
+total_files <- length(file_list)
+# Initialize an empty list to store formatted data tables
+formatted_data_list <- vector("list", total_files)
+# Create a progress bar
+pb <- progress_bar$new(
+  total = total_files,
+  format = "[:bar] :percent eta: :eta :current/:total (:file)"
+)
+
+# Loop to read files, clump and format data
+for (i in 1:total_files) {
+  file_path <- file_list[i]
+  file_name <- tools::file_path_sans_ext(basename(file_path))  # Get the file name without extension
+  tryCatch({
+    data <- fread(file_path)  # Use data.table's fread function to read the file
+    data[, file_name := file_name]  # Add the file name as a column
+    
+    # Perform clumping
+    clumped_data <- ieugwasr::ld_clump(
+      data,
+      clump_kb = 10000,
+      clump_r2 = 0.001,
+      clump_p = 5e-6,
+      pop = "EUR",
+      bfile = "/home/1kgv3/EUR",
+      plink_bin = "/usr/local/lib/R/site-library/plinkbinr/bin/plink_Linux"
+    )
+    
+    # Format data
+    formatted_data <- TwoSampleMR::format_data(
+      clumped_data,
+      type = "exposure",
+      snps = NULL,
+      header = TRUE,
+      phenotype_col = "file_name",
+      snp_col = "SNP",
+      beta_col = "BETA",
+      se_col = "SE",
+      eaf_col = 'AF1',
+      effect_allele_col = "A1",
+      other_allele_col = "A2",
+      pval_col = "P",
+      chr_col = 'CHR',
+      pos_col = 'POS',
+      samplesize_col = 'N',
+      gene_col = 'gene'
+    )
+    
+    formatted_data_list[[i]] <- formatted_data  # Store the formatted data in the list
+  }, error = function(e) {
+    message(sprintf("Error processing file %s: %s", file_path, e$message))
+  })
+  
+  # Update progress bar
+  pb$tick(tokens = list(file = basename(file_path)))
+}
+
+# Combine all formatted data tables
+combined_exposure_dt <- rbindlist(formatted_data_list, use.names = TRUE, fill = TRUE)
+
+
+
+### using QRS as outcome as example ###
+QRS <- fread('GCST007103.tsv')
+QRS  <- TwoSampleMR::format_data (QRS,
+                                  type = "outcome", 
+                                  snps = NULL,
+                                  header = TRUE,
+                                  snp_col = "rsid",
+                                  beta_col = "beta",
+                                  se_col = "se",
+                                  eaf_col = 'eaf',
+                                  effect_allele_col = "effect_allele",
+                                  other_allele_col = "non_effect_allele",
+                                  pval_col = "pval",
+                                  chr_col = 'chromosome',
+                                  pos_col = 'position_GRCh37',
+                                  samplesize_col = 'n_total',
+                                  gene_col = 'gene')
+QRS$outcome<- 'QRS'
+QRS$id.outcome <- 'QRS'
+mydata <- harmonise_data(exposure_dat=combined_exposure_dt,outcome_dat=QRS,action= 2)
+res <- mr(mydata)
+OR <- generate_odds_ratios(res)
+OR$OR_combined <- sprintf("%.3f (%.3f-%.3f)", as.numeric(OR$or), OR$or_lci95, OR$or_uci95)
+het_ivw <- mr_heterogeneity(mydata,method_list = c('mr_ivw'))
+het_egger <- mr_heterogeneity(mydata,method_list = c('mr_egger_regression'))
+pleio <- mr_pleiotropy_test(mydata)
