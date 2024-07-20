@@ -103,7 +103,7 @@ get_f<-function(dat,F_value=10){
   }
 }
 
-### because there is no eaf in PWD, we need to add eaf online 
+### because there is no eaf in P wave duarion GWAS data, we need to add eaf from other source, for example, using ensembl website online data 
 snp_add_eaf <- function(dat, build = "37", pop = "EUR")
 {
   stopifnot(build %in% c("37","38"))
